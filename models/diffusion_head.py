@@ -5,9 +5,10 @@ Implements following classes:
     - Forward and reverse process
     - Loss function
 '''
+import math
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
 
 @dataclass
@@ -126,6 +127,8 @@ class DiffusionPolicyHead(nn.Module):
         self.register_buffer("alpha_bar", alpha_cumulative)
         self.register_buffer("sqrt_alpha_bar", sqrt_alpha_cumulative)
         self.register_buffer("sqrt_one_minus_alpha_bar", sqrt_one_minus_alpha_cumulative)
+        self.register_buffer("one_by_sqrt_alpha", one_by_sqrt_alpha)
+        self.register_buffer("sqrt_betas", sqrt_betas)
 
     def q_sample(self, x0, t, noise):
         '''
@@ -143,11 +146,11 @@ class DiffusionPolicyHead(nn.Module):
     
     def loss(self, actions, cond):
         B = actions.size(0)
-        device = actions.device()
+        device = actions.device
         # random noise for action
         noise = torch.rand_like(actions) # (B, action_dim)
         # random timesteps
-        t = torch.rand_int(1, self.cfg.T, (B,), device=device)
+        t = torch.randint(0, self.cfg.T, (B,), device=device)
         # generate noisy actions
         xt = self.q_sample(actions, t=t, noise=noise)
         # predict noise from noisy actions conditioned over fused inputs (context)
@@ -156,3 +159,37 @@ class DiffusionPolicyHead(nn.Module):
         loss = F.mse_loss(noise, eps_pred)
         return loss
 
+    @torch.no_grad()
+    def sample(self, cond, n_samples=None):
+        '''        
+        :param self: Description
+        :param cond: fused context vector (B, model_dim) or (1, model_dim)
+        returns: actions (B, action_dim)
+        '''
+        self.eval()
+        if n_samples is None:
+            B = cond.size(0)
+        else:
+            B = n_samples
+            cond = cond.expand(B, -1)
+        # random noisy actions (B, action_dim)
+        x_t = torch.randn(B, self.cfg.action_dim, device=cond.device)
+        # iteratively denoise
+        for t_step in reversed(range(self.cfg.T)):
+            # create timestep vector
+            t = torch.ones((B,), dtype=torch.long, device=cond.device) * t_step
+            # predict noise
+            eps_pred = self.denoise_action_model(x_t, t, cond)
+            # denoise action (reverse diffusion)
+            # mean = (1 / torch.sqrt(alpha_t)) * (x_t - beta_t / torch.sqrt(1 - alpha_bar_t) * eps_pred) # original
+            x0_pred = (x_t * self.sqrt_one_minus_alpha_bar[t] * eps_pred) * (1.0 / self.sqrt_alpha_bar[t]) # simplified
+            # add nosie for stochasticity and prevent mode collapse
+            if t_step > 0:
+                noise = torch.randn_like(x_t)
+                # x_t = mean + torch.sqrt(beta_t) * noise # original
+                x_t = self.alphas[t] * x0_pred + self.sqrt_betas[t] * noise
+            else:
+                x_t = x0_pred
+        
+        return x_t
+                
