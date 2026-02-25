@@ -8,6 +8,7 @@ Implements following classes:
 import torch
 import torch.nn as nn
 import math
+import torch.nn.functional as F
 
 @dataclass
 class DiffusionConfig:
@@ -22,9 +23,10 @@ def make_beta_schedule(cfg: DiffusionConfig):
     sqrt_betas =  torch.sqrt(betas)
     alphas = 1 - betas
     alpha_cumulative = torch.cumprod(alphas, dim=0)
+    sqrt_alpha_cumulative = torch.sqrt(alpha_cumulative)
     one_by_sqrt_alpha = 1. / torch.sqrt(alphas)
     sqrt_one_minus_alpha_cumulative = torch.sqrt(1. - alpha_cumulative)
-    return betas, sqrt_betas, alpha_cumulative, one_by_sqrt_alpha, sqrt_one_minus_alpha_cumulative
+    return betas, sqrt_betas, alpha_cumulative, one_by_sqrt_alpha, sqrt_alpha_cumulative, sqrt_one_minus_alpha_cumulative
 
 
 class SinusoidalPositionEmbedding(nn.Module):
@@ -84,9 +86,7 @@ class ActionDenoiseModel(nn.Module):
         )
     
     def forward(self, x_t, t, cond):
-        """
-        Docstring for forward
-        
+        """        
         :param self: Description
         :param t: timestep
         :param x: noisy action
@@ -100,7 +100,6 @@ class ActionDenoiseModel(nn.Module):
 
 class DiffusionPolicyHead(nn.Module):
     """
-    Docstring for DiffusionPolicyHead
     Runs training and inference
     Training:
     - compute loss
@@ -112,3 +111,48 @@ class DiffusionPolicyHead(nn.Module):
         - Compute denoised action conditioned on encoded inputs (image, text, state)
 
     """
+    def __init__(self):
+        super().__init__()
+        self.cfg = DiffusionConfig
+        betas, sqrt_betas, alpha_cumulative, one_by_sqrt_alpha, \
+        sqrt_alpha_cumulative, sqrt_one_minus_alpha_cumulative = make_beta_schedule(self.cfg)
+        self.denoise_action_model = ActionDenoiseModel(self.cfg, time_emb=32)
+        '''
+        - register a non-trainable tensor as part of a module's state
+        - buffer is automatically included in the model's state_dict() when saving the model
+        - automatically moved to the specified device
+        '''
+        self.register_buffer("betas", betas)
+        self.register_buffer("alpha_bar", alpha_cumulative)
+        self.register_buffer("sqrt_alpha_bar", sqrt_alpha_cumulative)
+        self.register_buffer("sqrt_one_minus_alpha_bar", sqrt_one_minus_alpha_cumulative)
+
+    def q_sample(self, x0, t, noise):
+        '''
+        Forward process for diffusion: take a clean action and adds noise based on t
+        
+        :param self: Description
+        :param x0: action without noise (B, action_dim)
+        :param t: timestep until to iteratively add noise (B,)
+        :param noise: noise to add to the action
+        '''
+        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].unsqueeze(dim=-1) # (B, 1)
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].unsqueeze(dim=-1)
+        xt = sqrt_alpha_bar_t * x0 + sqrt_one_minus_alpha_bar_t * noise
+        return xt
+    
+    def loss(self, actions, cond):
+        B = actions.size(0)
+        device = actions.device()
+        # random noise for action
+        noise = torch.rand_like(actions) # (B, action_dim)
+        # random timesteps
+        t = torch.rand_int(1, self.cfg.T, (B,), device=device)
+        # generate noisy actions
+        xt = self.q_sample(actions, t=t, noise=noise)
+        # predict noise from noisy actions conditioned over fused inputs (context)
+        eps_pred = self.denoise_action_model(xt, t, cond)
+        # compute loss
+        loss = F.mse_loss(noise, eps_pred)
+        return loss
+
