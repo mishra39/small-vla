@@ -57,4 +57,56 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-    
+    device = torch.device(args.device torch.cuda.is_available() else "cpu")
+    dataset = TrainingDataset(args.dataset_path, resize_to=args.resize_to)
+    vocab_size = max(dataset.vocab.values()) + 1
+    state_dim = dataset.states.shape[1]
+    action_dim = dataset.actions.shape[1]
+
+    model = VLADiffusionPolicy(
+        vocab_size=vocab_size,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        d_model=args.d_model,
+        diffusion_T=args.diffusion_T
+    ).to(device)
+
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    num_epochs = args.epochs
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0.0
+        for img, state, action, text_ids in loader:
+            img = img.to(device)
+            state = state.to(device)
+            action = action.to(device)
+            text_ids = text_ids.to(device)
+
+            loss = model.loss(img, text_ids, state, action)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss * img.size(0)
+
+        avg_loss = total_loss / len(dataset)
+        print(f"Epoch {epoch+1}/{num_epochs}  loss={avg_loss:.4f}")
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "vocab": dataset.vocab,
+            "state_dim": state_dim,
+            "action_dim": action_dim,
+            "d_model": args.d_model,
+            "diffusion_T": args.diffusion_T,
+        },
+        args.save_path,
+    )
+    print("Saved checkpoint:", args.save_path)
+
+
+if __name__ == "__main__":
+    main()
